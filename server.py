@@ -9,6 +9,7 @@ Uchta xizmatni bitta API orqali taqdim etadi:
 
 import ssl
 import os
+import io
 import socket
 import hashlib
 import requests
@@ -16,8 +17,14 @@ import dns.resolver
 import dns.exception
 import whois
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
 
 app = Flask(__name__)
 CORS(app)  # Frontend (boshqa domendan) so'rov yubora olishi uchun
@@ -288,6 +295,22 @@ def _dnssec_tekshir(domen):
         return {"faol": False}
 
 
+def _caa_tekshir(domen):
+    """CAA yozuvini qidiradi (qaysi provayderlar sertifikat berishi mumkin)."""
+    try:
+        javoblar = dns.resolver.resolve(domen, "CAA", lifetime=6)
+        royxat = []
+        for r in javoblar:
+            royxat.append({
+                "flag": r.flags,
+                "tag": r.tag.decode() if isinstance(r.tag, bytes) else str(r.tag),
+                "qiymat": r.value.decode() if isinstance(r.value, bytes) else str(r.value)
+            })
+        return {"mavjud": len(royxat) > 0, "yozuvlar": royxat}
+    except (dns.exception.DNSException, Exception):
+        return {"mavjud": False, "yozuvlar": []}
+
+
 @app.route("/api/dns", methods=["GET"])
 def dns_endpoint():
     domen = request.args.get("domen", "")
@@ -301,20 +324,25 @@ def dns_endpoint():
         dkim = _dkim_tekshir(domen)
         dmarc = _dmarc_tekshir(domen)
         dnssec = _dnssec_tekshir(domen)
+        caa = _caa_tekshir(domen)
 
         # ---- Ball hisoblash ----
         ball = 0
         if spf["mavjud"]:
-            ball += 25
-        if dkim["mavjud"]:
             ball += 20
+        if dkim["mavjud"]:
+            ball += 15
         if dmarc["mavjud"]:
             if dmarc["siyosat"] in ("reject", "quarantine"):
-                ball += 30
+                ball += 25
             elif dmarc["siyosat"] == "none":
-                ball += 10
+                ball += 8
         if dnssec["faol"]:
-            ball += 25
+            ball += 20
+        if caa["mavjud"]:
+            ball += 20
+
+        ball = min(ball, 100)
 
         return jsonify({
             "muvaffaqiyat": True,
@@ -323,6 +351,7 @@ def dns_endpoint():
             "dkim": dkim,
             "dmarc": dmarc,
             "dnssec": dnssec,
+            "caa": caa,
             "ball": ball,
             "jami_ball": 100
         })
@@ -784,6 +813,383 @@ def pwnedpassword_endpoint():
         return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
 
 
+# ---------- 13. HTTP -> HTTPS MAJBURIY YO'NALTIRISH VA SECURITY.TXT ----------
+@app.route("/api/extrachecks", methods=["GET"])
+def extrachecks_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    # ---- HTTP -> HTTPS yo'naltirish ----
+    https_yonaltirish = {"mavjud": False, "tafsilot": "Tekshirib bo'lmadi"}
+    try:
+        http_javob = requests.get(
+            f"http://{domen}", timeout=8, allow_redirects=False,
+            headers={"User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"}
+        )
+        joylashuv = http_javob.headers.get("Location", "")
+        if http_javob.status_code in (301, 302, 307, 308) and joylashuv.startswith("https://"):
+            https_yonaltirish = {"mavjud": True, "tafsilot": f"HTTP -> HTTPS ga yo'naltiriladi ({http_javob.status_code})"}
+        else:
+            https_yonaltirish = {"mavjud": False, "tafsilot": "HTTP so'rovi HTTPS'ga avtomatik yo'naltirilmaydi"}
+    except requests.exceptions.RequestException:
+        https_yonaltirish = {"mavjud": False, "tafsilot": "HTTP portiga ulanib bo'lmadi"}
+
+    # ---- security.txt ----
+    security_txt = {"mavjud": False}
+    try:
+        st_javob = requests.get(
+            f"https://{domen}/.well-known/security.txt", timeout=6,
+            headers={"User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"}
+        )
+        if st_javob.status_code == 200 and len(st_javob.text.strip()) > 0:
+            security_txt = {"mavjud": True}
+    except requests.exceptions.RequestException:
+        pass
+
+    return jsonify({
+        "muvaffaqiyat": True,
+        "domen": domen,
+        "https_yonaltirish": https_yonaltirish,
+        "security_txt": security_txt
+    })
+
+
+# ---------- 14. PDF HISOBOT GENERATSIYASI ----------
+# Frontend barcha 12+ tekshiruv natijasini quyidagi formatda yuboradi:
+# {
+#   "domen": "example.com",
+#   "umumiy_ball": 75,
+#   "daraja": "B",
+#   "bolimlar": [
+#       {"nomi": "SSL Sertifikat", "holat": "Yaxshi", "tafsilotlar": ["Provayder: Let's Encrypt", "56 kun qoldi"]},
+#       ...
+#   ]
+# }
+QU_RANG = colors.HexColor("#0EA5A5")
+QORA_FON = colors.HexColor("#0B1120")
+
+
+def _pdf_logo_chiz(canvas_obj, doc):
+    """Har bir sahifa tepasiga 'QU' logotipi va sarlavha chizadi."""
+    canvas_obj.saveState()
+    sahifa_kengligi, sahifa_balandligi = A4
+
+    # Logotip doirasi
+    canvas_obj.setFillColor(QU_RANG)
+    canvas_obj.circle(28 * mm, sahifa_balandligi - 18 * mm, 10 * mm, fill=1, stroke=0)
+    canvas_obj.setFillColor(colors.white)
+    canvas_obj.setFont("Helvetica-Bold", 14)
+    canvas_obj.drawCentredString(28 * mm, sahifa_balandligi - 20.5 * mm, "QU")
+
+    # Sarlavha matni
+    canvas_obj.setFillColor(colors.HexColor("#111827"))
+    canvas_obj.setFont("Helvetica-Bold", 13)
+    canvas_obj.drawString(44 * mm, sahifa_balandligi - 16 * mm, "Xavfsizlik Tekshiruvi Hisoboti")
+    canvas_obj.setFont("Helvetica", 8)
+    canvas_obj.setFillColor(colors.HexColor("#6B7280"))
+    canvas_obj.drawString(44 * mm, sahifa_balandligi - 21 * mm, "QU Enterprise Security Audit")
+
+    # Pastki chiziq
+    canvas_obj.setStrokeColor(colors.HexColor("#E5E7EB"))
+    canvas_obj.line(20 * mm, sahifa_balandligi - 26 * mm, sahifa_kengligi - 20 * mm, sahifa_balandligi - 26 * mm)
+
+    # Sahifa raqami
+    canvas_obj.setFont("Helvetica", 8)
+    canvas_obj.setFillColor(colors.HexColor("#9CA3AF"))
+    canvas_obj.drawRightString(sahifa_kengligi - 20 * mm, 12 * mm, f"Sahifa {doc.page}")
+
+    canvas_obj.restoreState()
+
+
+def _holat_rangi(holat_matni):
+    matn = (holat_matni or "").lower()
+    if any(s in matn for s in ["yaxshi", "faol", "xavfsiz", "topilmadi", "a'lo", "ha"]):
+        return colors.HexColor("#059669")  # yashil
+    if any(s in matn for s in ["o'rtacha", "diqqat", "tez orada"]):
+        return colors.HexColor("#D97706")  # sariq
+    if any(s in matn for s in ["xavfli", "yo'q", "ochiq", "topildi", "muddati tugagan"]):
+        return colors.HexColor("#DC2626")  # qizil
+    return colors.HexColor("#6B7280")  # kulrang (neytral)
+
+
+@app.route("/api/report", methods=["POST"])
+def report_endpoint():
+    malumot = request.get_json(silent=True) or {}
+
+    domen = malumot.get("domen", "Noma'lum domen")
+    umumiy_ball = malumot.get("umumiy_ball", 0)
+    daraja = malumot.get("daraja", "-")
+    bolimlar = malumot.get("bolimlar", [])
+
+    try:
+        buffer = io.BytesIO()
+        hujjat = SimpleDocTemplate(
+            buffer, pagesize=A4,
+            topMargin=32 * mm, bottomMargin=20 * mm,
+            leftMargin=20 * mm, rightMargin=20 * mm
+        )
+
+        uslublar = getSampleStyleSheet()
+        sarlavha_uslubi = ParagraphStyle(
+            "BolimSarlavha", parent=uslublar["Heading2"],
+            fontSize=13, spaceBefore=10, spaceAfter=4,
+            textColor=colors.HexColor("#111827")
+        )
+        matn_uslubi = ParagraphStyle(
+            "Matn", parent=uslublar["Normal"],
+            fontSize=10, textColor=colors.HexColor("#374151"), leading=14
+        )
+        katta_uslub = ParagraphStyle(
+            "Katta", parent=uslublar["Normal"],
+            fontSize=28, alignment=TA_CENTER, textColor=QU_RANG,
+            spaceAfter=2
+        )
+
+        elementlar = []
+
+        # ---- Umumiy ma'lumot bloki ----
+        elementlar.append(Paragraph(f"<b>Domen:</b> {domen}", matn_uslubi))
+        elementlar.append(Paragraph(
+            f"<b>Sana:</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}", matn_uslubi
+        ))
+        elementlar.append(Spacer(1, 10))
+        elementlar.append(Paragraph(f"{umumiy_ball} / 100", katta_uslub))
+        elementlar.append(Paragraph(
+            f"<para alignment='center'><b>Umumiy Daraja: {daraja}</b></para>", matn_uslubi
+        ))
+        elementlar.append(Spacer(1, 14))
+
+        # ---- Har bir bo'lim ----
+        for bolim in bolimlar:
+            nomi = bolim.get("nomi", "Noma'lum bo'lim")
+            holat = bolim.get("holat", "")
+            tafsilotlar = bolim.get("tafsilotlar", [])
+
+            sarlavha_jadval_malumoti = [[
+                Paragraph(f"<b>{nomi}</b>", sarlavha_uslubi),
+                Paragraph(
+                    f"<font color='{_holat_rangi(holat).hexval() if hasattr(_holat_rangi(holat), 'hexval') else '#6B7280'}'><b>{holat}</b></font>",
+                    matn_uslubi
+                )
+            ]]
+            jadval = Table(sarlavha_jadval_malumoti, colWidths=[120 * mm, 50 * mm])
+            jadval.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            elementlar.append(jadval)
+
+            for qator in tafsilotlar:
+                elementlar.append(Paragraph(f"&bull; {qator}", matn_uslubi))
+
+            elementlar.append(Spacer(1, 8))
+
+        if not bolimlar:
+            elementlar.append(Paragraph("Hisobot uchun ma'lumot topilmadi.", matn_uslubi))
+
+        hujjat.build(elementlar, onFirstPage=_pdf_logo_chiz, onLaterPages=_pdf_logo_chiz)
+        buffer.seek(0)
+
+        fayl_nomi = f"xavfsizlik-hisobot-{domen.replace('.', '-')}.pdf"
+        return send_file(
+            buffer, mimetype="application/pdf",
+            as_attachment=True, download_name=fayl_nomi
+        )
+
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
+# ---------- 13. HTTP->HTTPS YO'NALTIRISH VA SECURITY.TXT TEKSHIRUVI ----------
+@app.route("/api/extras", methods=["GET"])
+def extras_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    # ---- HTTP -> HTTPS majburiy yo'naltirish ----
+    https_yonaltirish = {"tekshirildi": False, "yonaltirilgan": False, "yakuniy_url": None}
+    try:
+        javob = requests.get(f"http://{domen}", timeout=8, allow_redirects=True, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+        https_yonaltirish["tekshirildi"] = True
+        https_yonaltirish["yonaltirilgan"] = javob.url.startswith("https://")
+        https_yonaltirish["yakuniy_url"] = javob.url
+    except requests.exceptions.RequestException:
+        https_yonaltirish["tekshirildi"] = False
+
+    # ---- security.txt fayli ----
+    security_txt = {"mavjud": False}
+    for yol in ["/.well-known/security.txt", "/security.txt"]:
+        try:
+            s_javob = requests.get(f"https://{domen}{yol}", timeout=6, headers={
+                "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+            })
+            if s_javob.status_code == 200 and "contact" in s_javob.text.lower():
+                security_txt["mavjud"] = True
+                security_txt["manzil"] = yol
+                break
+        except requests.exceptions.RequestException:
+            continue
+
+    return jsonify({
+        "muvaffaqiyat": True,
+        "domen": domen,
+        "https_yonaltirish": https_yonaltirish,
+        "security_txt": security_txt
+    })
+
+
+# ---------- 14. "QU" LOGOTIPLI PDF HISOBOT ----------
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas as pdf_canvas
+from flask import send_file
+import io
+
+
+def _pdf_logo_chiz(c, x, y):
+    """'QU' harflaridan iborat doiraviy logotipni chizadi."""
+    c.setFillColor(colors.HexColor("#0EA5A0"))
+    c.circle(x, y, 9 * mm, stroke=0, fill=1)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawCentredString(x, y - 5, "QU")
+
+
+def _pdf_qator(c, x, y, matn, hajm=10, qalin=False, rang=colors.black):
+    c.setFillColor(rang)
+    c.setFont("Helvetica-Bold" if qalin else "Helvetica", hajm)
+    c.drawString(x, y, matn)
+
+
+@app.route("/api/report", methods=["GET"])
+def report_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    try:
+        # ---- Asosiy tekshiruvlarni to'g'ridan-to'g'ri (ichki funksiyalar orqali) yig'amiz ----
+        ssl_natija = {}
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((domen, 443), timeout=6) as sock:
+                with context.wrap_socket(sock, server_hostname=domen) as ssock:
+                    sert = ssock.getpeercert()
+                    protokol = ssock.version()
+                    issuer = dict(x[0] for x in sert['issuer'])
+                    issuer_nomi = issuer.get('organizationName', issuer.get('commonName', "Noma'lum"))
+                    tugash_sana = datetime.strptime(sert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                    qolgan_kun = (tugash_sana - datetime.now(timezone.utc).replace(tzinfo=None)).days
+                    ssl_natija = {"holat": "Faol", "issuer": issuer_nomi, "protokol": protokol, "qolgan_kun": qolgan_kun}
+        except Exception:
+            ssl_natija = {"holat": "Tekshirib bo'lmadi"}
+
+        headers_natija = []
+        try:
+            h_javob = requests.get(f"https://{domen}", timeout=8, headers={"User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"})
+            for h_nomi in TEKSHIRILADIGAN_HEADERLAR:
+                headers_natija.append({"nomi": h_nomi, "mavjud": h_nomi in h_javob.headers})
+        except Exception:
+            pass
+
+        spf = _spf_tekshir(domen)
+        dmarc = _dmarc_tekshir(domen)
+        dnssec = _dnssec_tekshir(domen)
+        caa = _caa_tekshir(domen)
+
+        portlar_natija = []
+        for port, info in TEKSHIRILADIGAN_PORTLAR.items():
+            portlar_natija.append({"port": port, "nomi": info["nomi"], "ochiq": _port_tekshir(domen, port, timeout=1.5)})
+
+        # ---- PDF yaratish ----
+        buffer = io.BytesIO()
+        c = pdf_canvas.Canvas(buffer, pagesize=A4)
+        kenglik, balandlik = A4
+
+        y = balandlik - 25 * mm
+        _pdf_logo_chiz(c, 20 * mm, y)
+        _pdf_qator(c, 35 * mm, y + 2, "Xavfsizlik Tekshiruvi", hajm=18, qalin=True)
+        _pdf_qator(c, 35 * mm, y - 6 * mm, "Enterprise Xavfsizlik Auditi Hisoboti", hajm=10, rang=colors.grey)
+
+        y -= 18 * mm
+        _pdf_qator(c, 20 * mm, y, f"Nishon: {domen}", hajm=12, qalin=True)
+        y -= 6 * mm
+        _pdf_qator(c, 20 * mm, y, f"Sana: {datetime.now().strftime('%d/%m/%Y %H:%M')}", hajm=9, rang=colors.grey)
+
+        y -= 12 * mm
+        c.setStrokeColor(colors.HexColor("#0EA5A0"))
+        c.line(20 * mm, y, kenglik - 20 * mm, y)
+        y -= 10 * mm
+
+        # SSL
+        _pdf_qator(c, 20 * mm, y, "1. SSL Sertifikat", hajm=12, qalin=True)
+        y -= 6 * mm
+        for k, v in ssl_natija.items():
+            _pdf_qator(c, 25 * mm, y, f"{k}: {v}", hajm=9)
+            y -= 5 * mm
+
+        y -= 5 * mm
+        _pdf_qator(c, 20 * mm, y, "2. Xavfsizlik Headerlari", hajm=12, qalin=True)
+        y -= 6 * mm
+        for h in headers_natija:
+            belgi = "Mavjud" if h["mavjud"] else "Yo'q"
+            _pdf_qator(c, 25 * mm, y, f"{h['nomi']}: {belgi}", hajm=9)
+            y -= 5 * mm
+
+        y -= 5 * mm
+        _pdf_qator(c, 20 * mm, y, "3. DNS / Email Xavfsizligi", hajm=12, qalin=True)
+        y -= 6 * mm
+        _pdf_qator(c, 25 * mm, y, f"SPF: {'Mavjud' if spf['mavjud'] else 'Yoq'}", hajm=9); y -= 5 * mm
+        _pdf_qator(c, 25 * mm, y, f"DMARC: {'Mavjud' if dmarc['mavjud'] else 'Yoq'}", hajm=9); y -= 5 * mm
+        _pdf_qator(c, 25 * mm, y, f"DNSSEC: {'Faol' if dnssec['faol'] else 'Faol emas'}", hajm=9); y -= 5 * mm
+        _pdf_qator(c, 25 * mm, y, f"CAA: {'Mavjud' if caa['mavjud'] else 'Yoq'}", hajm=9); y -= 5 * mm
+
+        y -= 5 * mm
+        if y < 40 * mm:
+            c.showPage()
+            y = balandlik - 25 * mm
+
+        _pdf_qator(c, 20 * mm, y, "4. Ochiq Portlar", hajm=12, qalin=True)
+        y -= 6 * mm
+        for p in portlar_natija:
+            belgi = "Ochiq" if p["ochiq"] else "Yopiq"
+            _pdf_qator(c, 25 * mm, y, f"Port {p['port']} ({p['nomi']}): {belgi}", hajm=9)
+            y -= 5 * mm
+            if y < 25 * mm:
+                c.showPage()
+                y = balandlik - 25 * mm
+
+        # Pastki qism
+        c.setFillColor(colors.grey)
+        c.setFont("Helvetica", 8)
+        c.drawCentredString(kenglik / 2, 12 * mm, "QU Xavfsizlik Tekshiruv Vositasi tomonidan avtomatik yaratildi")
+
+        c.save()
+        buffer.seek(0)
+
+        return send_file(
+            buffer,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"xavfsizlik-hisobot-{domen}.pdf"
+        )
+
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
 # ---------- SALOMLASHISH (server ishlab turganini tekshirish uchun) ----------
 @app.route("/", methods=["GET"])
 def index():
@@ -793,7 +1199,8 @@ def index():
         "endpointlar": [
             "/api/ssl", "/api/headers", "/api/email", "/api/dns",
             "/api/ports", "/api/whois", "/api/blacklist", "/api/subdomains",
-            "/api/techscan", "/api/networkinfo", "/api/mailrecords", "/api/pwnedpassword"
+            "/api/techscan", "/api/networkinfo", "/api/mailrecords", "/api/pwnedpassword",
+            "/api/extras", "/api/report"
         ]
     })
 

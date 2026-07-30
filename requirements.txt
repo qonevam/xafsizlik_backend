@@ -4,3 +4,5 @@ requests
 gunicorn
 dnspython
 python-whois
+reportlab
+reportlab
