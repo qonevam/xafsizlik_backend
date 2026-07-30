@@ -915,14 +915,84 @@ def _holat_rangi(holat_matni):
     return colors.HexColor("#6B7280")  # kulrang (neytral)
 
 
-@app.route("/api/report", methods=["POST"])
+@app.route("/api/report", methods=["GET", "POST"])
 def report_endpoint():
-    malumot = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        malumot = request.get_json(silent=True) or {}
+        domen = malumot.get("domen", "Noma'lum domen")
+        umumiy_ball = malumot.get("umumiy_ball", 0)
+        daraja = malumot.get("daraja", "-")
+        bolimlar = malumot.get("bolimlar", [])
+    else:
+        # ---- GET: domen=... orqali chaqirilsa, backend o'zi barcha
+        # tekshiruvlarni bajarib, natijalarni "bolimlar" formatiga o'tkazadi ----
+        domen = request.args.get("domen", "")
+        if not domen:
+            return jsonify({"xato": "domen parametri kerak"}), 400
+        domen = domen_tozala(domen)
 
-    domen = malumot.get("domen", "Noma'lum domen")
-    umumiy_ball = malumot.get("umumiy_ball", 0)
-    daraja = malumot.get("daraja", "-")
-    bolimlar = malumot.get("bolimlar", [])
+        bolimlar = []
+
+        # SSL
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((domen, 443), timeout=6) as sock:
+                with context.wrap_socket(sock, server_hostname=domen) as ssock:
+                    sert = ssock.getpeercert()
+                    protokol = ssock.version()
+                    issuer = dict(x[0] for x in sert['issuer'])
+                    issuer_nomi = issuer.get('organizationName', issuer.get('commonName', "Noma'lum"))
+                    tugash_sana = datetime.strptime(sert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                    qolgan_kun = (tugash_sana - datetime.now(timezone.utc).replace(tzinfo=None)).days
+                    bolimlar.append({
+                        "nomi": "SSL Sertifikat",
+                        "holat": "Faol" if qolgan_kun > 0 else "Muddati tugagan",
+                        "tafsilotlar": [f"Beruvchi: {issuer_nomi}", f"Protokol: {protokol}", f"Qolgan kun: {qolgan_kun}"]
+                    })
+        except Exception:
+            bolimlar.append({"nomi": "SSL Sertifikat", "holat": "Tekshirib bo'lmadi", "tafsilotlar": []})
+
+        # Headerlar
+        try:
+            h_javob = requests.get(f"https://{domen}", timeout=8, headers={"User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"})
+            yoq_headerlar = [h for h in TEKSHIRILADIGAN_HEADERLAR if h not in h_javob.headers]
+            bolimlar.append({
+                "nomi": "Xavfsizlik Headerlari",
+                "holat": "Barchasi mavjud" if not yoq_headerlar else f"{len(yoq_headerlar)} ta yo'q",
+                "tafsilotlar": [f"Yo'q: {h}" for h in yoq_headerlar] if yoq_headerlar else ["Barcha muhim headerlar sozlangan"]
+            })
+        except Exception:
+            bolimlar.append({"nomi": "Xavfsizlik Headerlari", "holat": "Tekshirib bo'lmadi", "tafsilotlar": []})
+
+        # DNS / Email
+        spf = _spf_tekshir(domen)
+        dmarc = _dmarc_tekshir(domen)
+        dnssec = _dnssec_tekshir(domen)
+        caa = _caa_tekshir(domen)
+        bolimlar.append({
+            "nomi": "DNS / Email Xavfsizligi",
+            "holat": "Yaxshi" if spf["mavjud"] and dmarc["mavjud"] else "Diqqat talab qiladi",
+            "tafsilotlar": [
+                f"SPF: {'mavjud' if spf['mavjud'] else 'yo\u2018q'}",
+                f"DMARC: {'mavjud' if dmarc['mavjud'] else 'yo\u2018q'}",
+                f"DNSSEC: {'faol' if dnssec['faol'] else 'faol emas'}",
+                f"CAA: {'mavjud' if caa['mavjud'] else 'yo\u2018q'}",
+            ]
+        })
+
+        # Portlar
+        ochiq_portlar = []
+        for port, info in TEKSHIRILADIGAN_PORTLAR.items():
+            if _port_tekshir(domen, port, timeout=1.5):
+                ochiq_portlar.append(f"Port {port} ({info['nomi']}) ochiq")
+        bolimlar.append({
+            "nomi": "Ochiq Portlar",
+            "holat": "Xavfsiz" if not ochiq_portlar else f"{len(ochiq_portlar)} ta ochiq",
+            "tafsilotlar": ochiq_portlar if ochiq_portlar else ["Xavfli portlar topilmadi"]
+        })
+
+        umumiy_ball = "-"
+        daraja = "-"
 
     try:
         buffer = io.BytesIO()
@@ -1045,149 +1115,6 @@ def extras_endpoint():
         "https_yonaltirish": https_yonaltirish,
         "security_txt": security_txt
     })
-
-
-# ---------- 14. "QU" LOGOTIPLI PDF HISOBOT ----------
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.pdfgen import canvas as pdf_canvas
-from flask import send_file
-import io
-
-
-def _pdf_logo_chiz(c, x, y):
-    """'QU' harflaridan iborat doiraviy logotipni chizadi."""
-    c.setFillColor(colors.HexColor("#0EA5A0"))
-    c.circle(x, y, 9 * mm, stroke=0, fill=1)
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(x, y - 5, "QU")
-
-
-def _pdf_qator(c, x, y, matn, hajm=10, qalin=False, rang=colors.black):
-    c.setFillColor(rang)
-    c.setFont("Helvetica-Bold" if qalin else "Helvetica", hajm)
-    c.drawString(x, y, matn)
-
-
-@app.route("/api/report", methods=["GET"])
-def report_endpoint():
-    domen = request.args.get("domen", "")
-    if not domen:
-        return jsonify({"xato": "domen parametri kerak"}), 400
-
-    domen = domen_tozala(domen)
-
-    try:
-        # ---- Asosiy tekshiruvlarni to'g'ridan-to'g'ri (ichki funksiyalar orqali) yig'amiz ----
-        ssl_natija = {}
-        try:
-            context = ssl.create_default_context()
-            with socket.create_connection((domen, 443), timeout=6) as sock:
-                with context.wrap_socket(sock, server_hostname=domen) as ssock:
-                    sert = ssock.getpeercert()
-                    protokol = ssock.version()
-                    issuer = dict(x[0] for x in sert['issuer'])
-                    issuer_nomi = issuer.get('organizationName', issuer.get('commonName', "Noma'lum"))
-                    tugash_sana = datetime.strptime(sert['notAfter'], "%b %d %H:%M:%S %Y %Z")
-                    qolgan_kun = (tugash_sana - datetime.now(timezone.utc).replace(tzinfo=None)).days
-                    ssl_natija = {"holat": "Faol", "issuer": issuer_nomi, "protokol": protokol, "qolgan_kun": qolgan_kun}
-        except Exception:
-            ssl_natija = {"holat": "Tekshirib bo'lmadi"}
-
-        headers_natija = []
-        try:
-            h_javob = requests.get(f"https://{domen}", timeout=8, headers={"User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"})
-            for h_nomi in TEKSHIRILADIGAN_HEADERLAR:
-                headers_natija.append({"nomi": h_nomi, "mavjud": h_nomi in h_javob.headers})
-        except Exception:
-            pass
-
-        spf = _spf_tekshir(domen)
-        dmarc = _dmarc_tekshir(domen)
-        dnssec = _dnssec_tekshir(domen)
-        caa = _caa_tekshir(domen)
-
-        portlar_natija = []
-        for port, info in TEKSHIRILADIGAN_PORTLAR.items():
-            portlar_natija.append({"port": port, "nomi": info["nomi"], "ochiq": _port_tekshir(domen, port, timeout=1.5)})
-
-        # ---- PDF yaratish ----
-        buffer = io.BytesIO()
-        c = pdf_canvas.Canvas(buffer, pagesize=A4)
-        kenglik, balandlik = A4
-
-        y = balandlik - 25 * mm
-        _pdf_logo_chiz(c, 20 * mm, y)
-        _pdf_qator(c, 35 * mm, y + 2, "Xavfsizlik Tekshiruvi", hajm=18, qalin=True)
-        _pdf_qator(c, 35 * mm, y - 6 * mm, "Enterprise Xavfsizlik Auditi Hisoboti", hajm=10, rang=colors.grey)
-
-        y -= 18 * mm
-        _pdf_qator(c, 20 * mm, y, f"Nishon: {domen}", hajm=12, qalin=True)
-        y -= 6 * mm
-        _pdf_qator(c, 20 * mm, y, f"Sana: {datetime.now().strftime('%d/%m/%Y %H:%M')}", hajm=9, rang=colors.grey)
-
-        y -= 12 * mm
-        c.setStrokeColor(colors.HexColor("#0EA5A0"))
-        c.line(20 * mm, y, kenglik - 20 * mm, y)
-        y -= 10 * mm
-
-        # SSL
-        _pdf_qator(c, 20 * mm, y, "1. SSL Sertifikat", hajm=12, qalin=True)
-        y -= 6 * mm
-        for k, v in ssl_natija.items():
-            _pdf_qator(c, 25 * mm, y, f"{k}: {v}", hajm=9)
-            y -= 5 * mm
-
-        y -= 5 * mm
-        _pdf_qator(c, 20 * mm, y, "2. Xavfsizlik Headerlari", hajm=12, qalin=True)
-        y -= 6 * mm
-        for h in headers_natija:
-            belgi = "Mavjud" if h["mavjud"] else "Yo'q"
-            _pdf_qator(c, 25 * mm, y, f"{h['nomi']}: {belgi}", hajm=9)
-            y -= 5 * mm
-
-        y -= 5 * mm
-        _pdf_qator(c, 20 * mm, y, "3. DNS / Email Xavfsizligi", hajm=12, qalin=True)
-        y -= 6 * mm
-        _pdf_qator(c, 25 * mm, y, f"SPF: {'Mavjud' if spf['mavjud'] else 'Yoq'}", hajm=9); y -= 5 * mm
-        _pdf_qator(c, 25 * mm, y, f"DMARC: {'Mavjud' if dmarc['mavjud'] else 'Yoq'}", hajm=9); y -= 5 * mm
-        _pdf_qator(c, 25 * mm, y, f"DNSSEC: {'Faol' if dnssec['faol'] else 'Faol emas'}", hajm=9); y -= 5 * mm
-        _pdf_qator(c, 25 * mm, y, f"CAA: {'Mavjud' if caa['mavjud'] else 'Yoq'}", hajm=9); y -= 5 * mm
-
-        y -= 5 * mm
-        if y < 40 * mm:
-            c.showPage()
-            y = balandlik - 25 * mm
-
-        _pdf_qator(c, 20 * mm, y, "4. Ochiq Portlar", hajm=12, qalin=True)
-        y -= 6 * mm
-        for p in portlar_natija:
-            belgi = "Ochiq" if p["ochiq"] else "Yopiq"
-            _pdf_qator(c, 25 * mm, y, f"Port {p['port']} ({p['nomi']}): {belgi}", hajm=9)
-            y -= 5 * mm
-            if y < 25 * mm:
-                c.showPage()
-                y = balandlik - 25 * mm
-
-        # Pastki qism
-        c.setFillColor(colors.grey)
-        c.setFont("Helvetica", 8)
-        c.drawCentredString(kenglik / 2, 12 * mm, "QU Xavfsizlik Tekshiruv Vositasi tomonidan avtomatik yaratildi")
-
-        c.save()
-        buffer.seek(0)
-
-        return send_file(
-            buffer,
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name=f"xavfsizlik-hisobot-{domen}.pdf"
-        )
-
-    except Exception as e:
-        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
 
 
 # ---------- SALOMLASHISH (server ishlab turganini tekshirish uchun) ----------
