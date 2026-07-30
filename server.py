@@ -498,9 +498,23 @@ def subdomains_endpoint():
 
     try:
         url = f"https://crt.sh/?q=%25.{domen}&output=json"
-        javob = requests.get(url, timeout=15, headers={
-            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
-        })
+
+        # crt.sh ba'zan birinchi so'rovda sekin/vaqtinchalik javob bermaydi,
+        # shuning uchun bitta qayta urinish qo'shildi
+        javob = None
+        oxirgi_xato = None
+        for urinish in range(2):
+            try:
+                javob = requests.get(url, timeout=25, headers={
+                    "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+                })
+                break
+            except requests.exceptions.Timeout as e:
+                oxirgi_xato = e
+                continue
+
+        if javob is None:
+            raise oxirgi_xato or requests.exceptions.Timeout()
 
         if javob.status_code != 200:
             return jsonify({"muvaffaqiyat": False, "xato": "crt.sh xizmati javob bermadi"}), 200
