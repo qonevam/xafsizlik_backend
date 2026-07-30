@@ -10,6 +10,8 @@ Uchta xizmatni bitta API orqali taqdim etadi:
 import ssl
 import socket
 import requests
+import dns.resolver
+import dns.exception
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -205,13 +207,134 @@ def email_endpoint():
         return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
 
 
+# ---------- 4. DNS XAVFSIZLIGI TEKSHIRUVI (SPF/DKIM/DMARC/DNSSEC) ----------
+
+# DKIM selector nomi domendan domenga farq qiladi va ochiq DNS orqali
+# avtomatik aniqlab bo'lmaydi. Shuning uchun eng ko'p tarqalgan
+# selector nomlari sinab ko'riladi.
+DKIM_SELEKTORLAR = [
+    "google", "default", "selector1", "selector2",
+    "k1", "dkim", "mail", "smtp", "email"
+]
+
+
+def _spf_tekshir(domen):
+    """Domenning SPF (TXT) yozuvini qidiradi."""
+    try:
+        javoblar = dns.resolver.resolve(domen, "TXT", lifetime=6)
+        for r in javoblar:
+            qiymat = b"".join(r.strings).decode("utf-8", errors="ignore")
+            if qiymat.startswith("v=spf1"):
+                if "-all" in qiymat:
+                    siyosat = "qattiq"
+                elif "~all" in qiymat:
+                    siyosat = "yumshoq"
+                elif "?all" in qiymat:
+                    siyosat = "neytral"
+                else:
+                    siyosat = "noma'lum"
+                return {"mavjud": True, "qiymat": qiymat, "siyosat": siyosat}
+        return {"mavjud": False, "qiymat": None, "siyosat": None}
+    except (dns.exception.DNSException, Exception):
+        return {"mavjud": False, "qiymat": None, "siyosat": None}
+
+
+def _dkim_tekshir(domen):
+    """Eng ko'p tarqalgan selectorlar bo'yicha DKIM yozuvini qidiradi."""
+    for selector in DKIM_SELEKTORLAR:
+        manzil = f"{selector}._domainkey.{domen}"
+        try:
+            javoblar = dns.resolver.resolve(manzil, "TXT", lifetime=4)
+            for r in javoblar:
+                qiymat = b"".join(r.strings).decode("utf-8", errors="ignore")
+                if "v=DKIM1" in qiymat or "p=" in qiymat:
+                    return {"mavjud": True, "selector": selector}
+        except (dns.exception.DNSException, Exception):
+            continue
+    return {"mavjud": False, "selector": None}
+
+
+def _dmarc_tekshir(domen):
+    """Domenning DMARC (_dmarc.domen) yozuvini qidiradi."""
+    manzil = f"_dmarc.{domen}"
+    try:
+        javoblar = dns.resolver.resolve(manzil, "TXT", lifetime=6)
+        for r in javoblar:
+            qiymat = b"".join(r.strings).decode("utf-8", errors="ignore")
+            if qiymat.startswith("v=DMARC1"):
+                if "p=reject" in qiymat:
+                    siyosat = "reject"
+                elif "p=quarantine" in qiymat:
+                    siyosat = "quarantine"
+                elif "p=none" in qiymat:
+                    siyosat = "none"
+                else:
+                    siyosat = "noma'lum"
+                return {"mavjud": True, "qiymat": qiymat, "siyosat": siyosat}
+        return {"mavjud": False, "qiymat": None, "siyosat": None}
+    except (dns.exception.DNSException, Exception):
+        return {"mavjud": False, "qiymat": None, "siyosat": None}
+
+
+def _dnssec_tekshir(domen):
+    """Domenning DNSKEY yozuvi mavjudligini tekshiradi (DNSSEC belgisi)."""
+    try:
+        dns.resolver.resolve(domen, "DNSKEY", lifetime=6)
+        return {"faol": True}
+    except (dns.exception.DNSException, Exception):
+        return {"faol": False}
+
+
+@app.route("/api/dns", methods=["GET"])
+def dns_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    try:
+        spf = _spf_tekshir(domen)
+        dkim = _dkim_tekshir(domen)
+        dmarc = _dmarc_tekshir(domen)
+        dnssec = _dnssec_tekshir(domen)
+
+        # ---- Ball hisoblash ----
+        ball = 0
+        if spf["mavjud"]:
+            ball += 25
+        if dkim["mavjud"]:
+            ball += 20
+        if dmarc["mavjud"]:
+            if dmarc["siyosat"] in ("reject", "quarantine"):
+                ball += 30
+            elif dmarc["siyosat"] == "none":
+                ball += 10
+        if dnssec["faol"]:
+            ball += 25
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "domen": domen,
+            "spf": spf,
+            "dkim": dkim,
+            "dmarc": dmarc,
+            "dnssec": dnssec,
+            "ball": ball,
+            "jami_ball": 100
+        })
+
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
 # ---------- SALOMLASHISH (server ishlab turganini tekshirish uchun) ----------
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "xizmat": "Xavfsizlik Tekshiruv Backend",
         "holat": "ishlamoqda",
-        "endpointlar": ["/api/ssl", "/api/headers", "/api/email"]
+        "endpointlar": ["/api/ssl", "/api/headers", "/api/email", "/api/dns"]
     })
 
 
