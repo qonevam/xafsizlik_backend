@@ -8,10 +8,12 @@ Uchta xizmatni bitta API orqali taqdim etadi:
 """
 
 import ssl
+import os
 import socket
 import requests
 import dns.resolver
 import dns.exception
+import whois
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -328,13 +330,215 @@ def dns_endpoint():
         return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
 
 
+# ---------- 5. OCHIQ PORTLARNI TEKSHIRISH ----------
+
+# Eng ko'p uchraydigan va xavfsizlik nuqtai nazaridan muhim portlar
+TEKSHIRILADIGAN_PORTLAR = {
+    21: {"nomi": "FTP", "tavsif": "Fayl uzatish protokoli, shifrlanmagan", "muhimlik": "yuqori"},
+    22: {"nomi": "SSH", "tavsif": "Masofaviy boshqaruv", "muhimlik": "orta"},
+    23: {"nomi": "Telnet", "tavsif": "Eski, shifrlanmagan masofaviy kirish", "muhimlik": "yuqori"},
+    25: {"nomi": "SMTP", "tavsif": "Email jo'natish serveri", "muhimlik": "orta"},
+    80: {"nomi": "HTTP", "tavsif": "Shifrlanmagan veb-server", "muhimlik": "orta"},
+    443: {"nomi": "HTTPS", "tavsif": "Shifrlangan xavfsiz veb-server", "muhimlik": "past"},
+    3306: {"nomi": "MySQL", "tavsif": "Ma'lumotlar bazasi, tashqariga ochiq bo'lmasligi kerak", "muhimlik": "yuqori"},
+    3389: {"nomi": "RDP", "tavsif": "Windows masofaviy ish stoli, hujumlar uchun mashhur nishon", "muhimlik": "yuqori"},
+    5432: {"nomi": "PostgreSQL", "tavsif": "Ma'lumotlar bazasi, tashqariga ochiq bo'lmasligi kerak", "muhimlik": "yuqori"},
+    6379: {"nomi": "Redis", "tavsif": "Xotira bazasi, ko'pincha parolsiz qoldiriladi", "muhimlik": "yuqori"},
+}
+
+
+def _port_tekshir(domen, port, timeout=2.5):
+    """Berilgan portga ulanishga harakat qiladi (faqat ochiq/yopiqligini bilish uchun)."""
+    try:
+        with socket.create_connection((domen, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
+@app.route("/api/ports", methods=["GET"])
+def ports_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    try:
+        natija = []
+        ochiq_soni = 0
+
+        for port, info in TEKSHIRILADIGAN_PORTLAR.items():
+            ochiq = _port_tekshir(domen, port)
+            if ochiq:
+                ochiq_soni += 1
+            natija.append({
+                "port": port,
+                "nomi": info["nomi"],
+                "tavsif": info["tavsif"],
+                "muhimlik": info["muhimlik"],
+                "ochiq": ochiq
+            })
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "domen": domen,
+            "portlar": natija,
+            "ochiq_soni": ochiq_soni,
+            "jami_tekshirilgan": len(TEKSHIRILADIGAN_PORTLAR)
+        })
+
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
+# ---------- 6. WHOIS MA'LUMOTLARI ----------
+@app.route("/api/whois", methods=["GET"])
+def whois_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    try:
+        malumot = whois.whois(domen)
+
+        def _sana_formatla(qiymat):
+            # ba'zi domenlarda sana ro'yxat qilib qaytadi, birinchisini olamiz
+            if isinstance(qiymat, list):
+                qiymat = qiymat[0] if qiymat else None
+            if isinstance(qiymat, datetime):
+                return qiymat.strftime("%d/%m/%Y")
+            return None
+
+        royxatdan_otgan = _sana_formatla(malumot.creation_date)
+        tugash_sanasi = _sana_formatla(malumot.expiration_date)
+        registrator = malumot.registrar if isinstance(malumot.registrar, str) else None
+
+        if not royxatdan_otgan and not tugash_sanasi and not registrator:
+            return jsonify({
+                "muvaffaqiyat": False,
+                "xato": "WHOIS ma'lumoti topilmadi (domen himoyalangan yoki mavjud emas)"
+            }), 200
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "domen": domen,
+            "registrator": registrator or "Noma'lum",
+            "royxatdan_otgan_sana": royxatdan_otgan or "Noma'lum",
+            "tugash_sanasi": tugash_sanasi or "Noma'lum"
+        })
+
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
+# ---------- 7. GOOGLE SAFE BROWSING (BLACKLIST TEKSHIRUVI) ----------
+# Bepul API kaliti kerak: https://developers.google.com/safe-browsing/v4/get-started
+# Kalitni Render'da "Environment Variables" bo'limiga GOOGLE_SAFE_BROWSING_KEY nomi bilan qo'shing
+SAFE_BROWSING_KALIT = os.environ.get("GOOGLE_SAFE_BROWSING_KEY", "")
+
+
+@app.route("/api/blacklist", methods=["GET"])
+def blacklist_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    if not SAFE_BROWSING_KALIT:
+        return jsonify({
+            "muvaffaqiyat": False,
+            "xato": "API kaliti sozlanmagan (GOOGLE_SAFE_BROWSING_KEY)"
+        }), 200
+
+    try:
+        url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={SAFE_BROWSING_KALIT}"
+        body = {
+            "client": {"clientId": "xavfsizlik-tekshiruv", "clientVersion": "1.0"},
+            "threatInfo": {
+                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"],
+                "threatEntries": [{"url": f"https://{domen}"}, {"url": f"http://{domen}"}]
+            }
+        }
+        javob = requests.post(url, json=body, timeout=8)
+
+        if javob.status_code != 200:
+            return jsonify({"muvaffaqiyat": False, "xato": f"API xatosi: {javob.status_code}"}), 200
+
+        natija = javob.json()
+        xavflar = natija.get("matches", [])
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "domen": domen,
+            "xavfli": len(xavflar) > 0,
+            "xavf_turlari": list({x.get("threatType") for x in xavflar}) if xavflar else []
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({"muvaffaqiyat": False, "xato": "Vaqt tugadi"}), 200
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
+# ---------- 8. SUBDOMENLARNI ANIQLASH (crt.sh orqali) ----------
+@app.route("/api/subdomains", methods=["GET"])
+def subdomains_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    try:
+        url = f"https://crt.sh/?q=%25.{domen}&output=json"
+        javob = requests.get(url, timeout=15, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+
+        if javob.status_code != 200:
+            return jsonify({"muvaffaqiyat": False, "xato": "crt.sh xizmati javob bermadi"}), 200
+
+        malumot = javob.json()
+
+        # Takroriy nomlarni olib tashlash
+        subdomenlar = set()
+        for yozuv in malumot:
+            nom = yozuv.get("name_value", "")
+            for qator in nom.split("\n"):
+                qator = qator.strip().lower()
+                if qator and not qator.startswith("*."):
+                    subdomenlar.add(qator)
+
+        royxat = sorted(subdomenlar)
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "domen": domen,
+            "subdomenlar": royxat,
+            "soni": len(royxat)
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({"muvaffaqiyat": False, "xato": "Vaqt tugadi (crt.sh sekin javob berdi)"}), 200
+    except ValueError:
+        return jsonify({"muvaffaqiyat": False, "xato": "Ma'lumotni o'qib bo'lmadi"}), 200
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
 # ---------- SALOMLASHISH (server ishlab turganini tekshirish uchun) ----------
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "xizmat": "Xavfsizlik Tekshiruv Backend",
         "holat": "ishlamoqda",
-        "endpointlar": ["/api/ssl", "/api/headers", "/api/email", "/api/dns"]
+        "endpointlar": ["/api/ssl", "/api/headers", "/api/email", "/api/dns", "/api/ports", "/api/whois", "/api/blacklist", "/api/subdomains"]
     })
 
 
