@@ -10,6 +10,7 @@ Uchta xizmatni bitta API orqali taqdim etadi:
 import ssl
 import os
 import socket
+import hashlib
 import requests
 import dns.resolver
 import dns.exception
@@ -532,13 +533,254 @@ def subdomains_endpoint():
         return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
 
 
+# ---------- 9. TEXNOLOGIYA, OCHIQ FAYLLAR VA COOKIE TEKSHIRUVI ----------
+
+# Tasodifan ochiq qolishi mumkin bo'lgan maxfiy fayllar
+MAXFIY_FAYLLAR = [
+    ".env", ".git/config", "wp-config.php.bak", "backup.sql",
+    "phpinfo.php", ".DS_Store", "config.php.bak", ".htpasswd"
+]
+
+# CMS/texnologiyalarni HTML ichidan aniqlash uchun belgilar
+CMS_BELGILARI = {
+    "WordPress": ["wp-content", "wp-includes"],
+    "Joomla": ["/media/jui/", "Joomla!"],
+    "Drupal": ["Drupal.settings", "/sites/default/"],
+    "Shopify": ["cdn.shopify.com"],
+    "Wix": ["static.wixstatic.com"],
+    "Laravel": ["laravel_session"],
+}
+
+
+@app.route("/api/techscan", methods=["GET"])
+def techscan_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+    url = f"https://{domen}"
+
+    try:
+        javob = requests.get(url, timeout=8, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+
+        # ---- Server / texnologiya ----
+        server_header = javob.headers.get("Server", "Noma'lum")
+        powered_by = javob.headers.get("X-Powered-By", "")
+
+        aniqlangan_cms = []
+        html_matn = javob.text[:200000]  # juda katta sahifalarni cheklash
+        for nom, belgilar in CMS_BELGILARI.items():
+            if any(b.lower() in html_matn.lower() for b in belgilar):
+                aniqlangan_cms.append(nom)
+
+        # ---- Cookie xavfsizligi ----
+        cookie_natijasi = []
+        for cookie in javob.cookies:
+            cookie_natijasi.append({
+                "nomi": cookie.name,
+                "secure": bool(cookie.secure),
+                "httponly": "httponly" in [k.lower() for k in cookie._rest.keys()] if hasattr(cookie, "_rest") else False,
+                "samesite": cookie._rest.get("SameSite", "Yo'q") if hasattr(cookie, "_rest") else "Yo'q"
+            })
+
+        # ---- Ochiq maxfiy fayllar ----
+        ochiq_fayllar = []
+        for fayl in MAXFIY_FAYLLAR:
+            try:
+                f_javob = requests.get(f"{url}/{fayl}", timeout=4, headers={
+                    "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+                }, allow_redirects=False)
+                if f_javob.status_code == 200 and len(f_javob.content) > 0:
+                    ochiq_fayllar.append(fayl)
+            except requests.exceptions.RequestException:
+                continue
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "domen": domen,
+            "server": server_header,
+            "powered_by": powered_by or "Noma'lum",
+            "cms": aniqlangan_cms,
+            "cookielar": cookie_natijasi,
+            "ochiq_maxfiy_fayllar": ochiq_fayllar
+        })
+
+    except requests.exceptions.SSLError:
+        return jsonify({"muvaffaqiyat": False, "xato": "SSL/HTTPS muammosi"}), 200
+    except requests.exceptions.ConnectionError:
+        return jsonify({"muvaffaqiyat": False, "xato": "Ulanib bo'lmadi"}), 200
+    except requests.exceptions.Timeout:
+        return jsonify({"muvaffaqiyat": False, "xato": "Vaqt tugadi"}), 200
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
+# ---------- 10. TARMOQ MA'LUMOTLARI (IP / GEOLOKATSIYA / CDN / REVERSE DNS) ----------
+
+CDN_KALIT_SOZLAR = {
+    "cloudflare": "Cloudflare",
+    "akamai": "Akamai",
+    "fastly": "Fastly",
+    "amazon": "Amazon CloudFront",
+    "sucuri": "Sucuri",
+    "incapsula": "Imperva Incapsula",
+    "google": "Google Cloud CDN",
+}
+
+
+@app.route("/api/networkinfo", methods=["GET"])
+def networkinfo_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    try:
+        ip = socket.gethostbyname(domen)
+    except socket.gaierror:
+        return jsonify({"muvaffaqiyat": False, "xato": "Domen IP manzilga aylantirib bo'lmadi"}), 200
+
+    natija = {
+        "muvaffaqiyat": True,
+        "domen": domen,
+        "ip": ip,
+        "mamlakat": "Noma'lum",
+        "shahar": "Noma'lum",
+        "provayder": "Noma'lum",
+        "cdn": None,
+        "reverse_dns": None
+    }
+
+    # ---- Geolokatsiya (ip-api.com, bepul, kalit kerak emas) ----
+    try:
+        geo_javob = requests.get(f"http://ip-api.com/json/{ip}", timeout=6)
+        if geo_javob.status_code == 200:
+            geo = geo_javob.json()
+            if geo.get("status") == "success":
+                natija["mamlakat"] = geo.get("country", "Noma'lum")
+                natija["shahar"] = geo.get("city", "Noma'lum")
+                natija["provayder"] = geo.get("isp", "Noma'lum")
+
+                # ---- CDN aniqlash (provayder/org nomi bo'yicha) ----
+                tekshiriladigan_matn = f"{geo.get('isp', '')} {geo.get('org', '')}".lower()
+                for kalit, nomi in CDN_KALIT_SOZLAR.items():
+                    if kalit in tekshiriladigan_matn:
+                        natija["cdn"] = nomi
+                        break
+    except requests.exceptions.RequestException:
+        pass
+
+    # ---- Reverse DNS (PTR) ----
+    try:
+        ptr = socket.gethostbyaddr(ip)
+        natija["reverse_dns"] = ptr[0]
+    except (socket.herror, socket.gaierror):
+        natija["reverse_dns"] = None
+
+    return jsonify(natija)
+
+
+# ---------- 11. MAIL YOZUVLARI (MX / BIMI) ----------
+@app.route("/api/mailrecords", methods=["GET"])
+def mailrecords_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+
+    domen = domen_tozala(domen)
+
+    # ---- MX yozuvlari ----
+    mx_royxati = []
+    try:
+        mx_javoblar = dns.resolver.resolve(domen, "MX", lifetime=6)
+        for r in mx_javoblar:
+            mx_royxati.append({
+                "server": str(r.exchange).rstrip("."),
+                "ustuvorlik": r.preference
+            })
+        mx_royxati.sort(key=lambda x: x["ustuvorlik"])
+    except (dns.exception.DNSException, Exception):
+        mx_royxati = []
+
+    # ---- BIMI yozuvi ----
+    bimi_mavjud = False
+    try:
+        bimi_javob = dns.resolver.resolve(f"default._bimi.{domen}", "TXT", lifetime=5)
+        for r in bimi_javob:
+            qiymat = b"".join(r.strings).decode("utf-8", errors="ignore")
+            if "v=BIMI1" in qiymat:
+                bimi_mavjud = True
+                break
+    except (dns.exception.DNSException, Exception):
+        bimi_mavjud = False
+
+    return jsonify({
+        "muvaffaqiyat": True,
+        "domen": domen,
+        "mx_yozuvlari": mx_royxati,
+        "mx_mavjud": len(mx_royxati) > 0,
+        "bimi_mavjud": bimi_mavjud
+    })
+
+
+# ---------- 12. PAROL SIZIB CHIQISHINI TEKSHIRISH (Pwned Passwords, k-anonymity) ----------
+# MUHIM: parolning o'zi hech qayerga yuborilmaydi. Faqat SHA1 xeshining
+# birinchi 5 belgisi HaveIBeenPwned'ga yuboriladi (k-anonymity usuli),
+# qolgan qismi serverda solishtiriladi. Bu usul to'liq xavfsiz.
+@app.route("/api/pwnedpassword", methods=["POST"])
+def pwnedpassword_endpoint():
+    malumot = request.get_json(silent=True) or {}
+    parol = malumot.get("parol", "")
+
+    if not parol:
+        return jsonify({"xato": "parol parametri kerak"}), 400
+
+    try:
+        sha1 = hashlib.sha1(parol.encode("utf-8")).hexdigest().upper()
+        prefiks, qolgan_qism = sha1[:5], sha1[5:]
+
+        url = f"https://api.pwnedpasswords.com/range/{prefiks}"
+        javob = requests.get(url, timeout=8, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+
+        if javob.status_code != 200:
+            return jsonify({"muvaffaqiyat": False, "xato": "Xizmat javob bermadi"}), 200
+
+        soni = 0
+        for qator in javob.text.splitlines():
+            qism, hisob = qator.split(":")
+            if qism.strip() == qolgan_qism:
+                soni = int(hisob.strip())
+                break
+
+        return jsonify({
+            "muvaffaqiyat": True,
+            "sizib_chiqqan": soni > 0,
+            "necha_marta_uchragan": soni
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({"muvaffaqiyat": False, "xato": "Vaqt tugadi"}), 200
+    except Exception as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
 # ---------- SALOMLASHISH (server ishlab turganini tekshirish uchun) ----------
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "xizmat": "Xavfsizlik Tekshiruv Backend",
         "holat": "ishlamoqda",
-        "endpointlar": ["/api/ssl", "/api/headers", "/api/email", "/api/dns", "/api/ports", "/api/whois", "/api/blacklist", "/api/subdomains"]
+        "endpointlar": [
+            "/api/ssl", "/api/headers", "/api/email", "/api/dns",
+            "/api/ports", "/api/whois", "/api/blacklist", "/api/subdomains",
+            "/api/techscan", "/api/networkinfo", "/api/mailrecords", "/api/pwnedpassword"
+        ]
     })
 
 
