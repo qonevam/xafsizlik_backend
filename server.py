@@ -10,11 +10,14 @@ Uchta xizmatni bitta API orqali taqdim etadi:
 import ssl
 import os
 import io
+import time
 import socket
 import hashlib
 import requests
 import dns.resolver
 import dns.exception
+import dns.zone
+import dns.query
 import whois
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_file
@@ -1117,6 +1120,250 @@ def extras_endpoint():
     })
 
 
+# ---------- 15. SSL/TLS CHUQUR TAHLILI ----------
+@app.route("/api/tlsdeep", methods=["GET"])
+def tlsdeep_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+    domen = domen_tozala(domen)
+
+    natija = {
+        "muvaffaqiyat": True, "domen": domen,
+        "zaif_protokollar": [], "san_royxati": [], "ocsp_stapling": False
+    }
+
+    # ---- Zaif TLS versiyalarini sinash (faqat handshake, hujum emas) ----
+    eski_protokollar = {
+        "TLSv1": ssl.TLSVersion.TLSv1 if hasattr(ssl.TLSVersion, "TLSv1") else None,
+        "TLSv1.1": ssl.TLSVersion.TLSv1_1 if hasattr(ssl.TLSVersion, "TLSv1_1") else None,
+    }
+    for nomi, versiya in eski_protokollar.items():
+        if versiya is None:
+            continue
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.minimum_version = versiya
+            ctx.maximum_version = versiya
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((domen, 443), timeout=5) as sock:
+                with ctx.wrap_socket(sock, server_hostname=domen):
+                    natija["zaif_protokollar"].append(nomi)
+        except Exception:
+            pass  # bu versiya qo'llab-quvvatlanmaydi (yaxshi holat)
+
+    # ---- SAN ro'yxati va OCSP ----
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domen, 443), timeout=6) as sock:
+            with context.wrap_socket(sock, server_hostname=domen) as ssock:
+                sert = ssock.getpeercert()
+                for turi, qiymat in sert.get("subjectAltName", []):
+                    if turi == "DNS":
+                        natija["san_royxati"].append(qiymat)
+                # OCSP stapling holatini aniqlash
+                try:
+                    ocsp = ssock.get_channel_binding("tls-server-end-point")
+                    natija["ocsp_stapling"] = ocsp is not None
+                except Exception:
+                    natija["ocsp_stapling"] = False
+    except Exception:
+        pass
+
+    return jsonify(natija)
+
+
+# ---------- 16. HTTP PROTOKOL DARAJASI TEKSHIRUVI ----------
+@app.route("/api/httpprotocol", methods=["GET"])
+def httpprotocol_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+    domen = domen_tozala(domen)
+
+    natija = {
+        "muvaffaqiyat": True, "domen": domen,
+        "http2_qollab_quvvatlaydi": False,
+        "xavfli_metodlar": [], "cors_xavfi": False, "cors_qiymati": None
+    }
+
+    # ---- HTTP/2 (ALPN orqali) ----
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        with socket.create_connection((domen, 443), timeout=6) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domen) as ssock:
+                natija["http2_qollab_quvvatlaydi"] = ssock.selected_alpn_protocol() == "h2"
+    except Exception:
+        pass
+
+    # ---- OPTIONS so'rovi orqali qaysi metodlar ochiqligini ko'rish ----
+    try:
+        javob = requests.options(f"https://{domen}", timeout=6, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+        allow = javob.headers.get("Allow", "")
+        xavfli = [m.strip() for m in allow.split(",") if m.strip().upper() in ("PUT", "DELETE", "TRACE", "CONNECT")]
+        natija["xavfli_metodlar"] = xavfli
+    except requests.exceptions.RequestException:
+        pass
+
+    # ---- CORS sozlamasi ----
+    try:
+        javob = requests.get(f"https://{domen}", timeout=6, headers={
+            "Origin": "https://misol-begona-domen.com",
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+        acao = javob.headers.get("Access-Control-Allow-Origin")
+        natija["cors_qiymati"] = acao
+        natija["cors_xavfi"] = acao == "*"
+    except requests.exceptions.RequestException:
+        pass
+
+    return jsonify(natija)
+
+
+# ---------- 17. DNS QO'SHIMCHA TAHLILI ----------
+@app.route("/api/dnsextra", methods=["GET"])
+def dnsextra_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+    domen = domen_tozala(domen)
+
+    natija = {
+        "muvaffaqiyat": True, "domen": domen,
+        "ipv6_mavjud": False, "nameserverlar": [], "zone_transfer_ochiq": False,
+        "wildcard_dns": False
+    }
+
+    # ---- IPv6 (AAAA) ----
+    try:
+        dns.resolver.resolve(domen, "AAAA", lifetime=6)
+        natija["ipv6_mavjud"] = True
+    except (dns.exception.DNSException, Exception):
+        natija["ipv6_mavjud"] = False
+
+    # ---- Nameserverlar ----
+    ns_royxati = []
+    try:
+        ns_javob = dns.resolver.resolve(domen, "NS", lifetime=6)
+        ns_royxati = [str(r.target).rstrip(".") for r in ns_javob]
+        natija["nameserverlar"] = ns_royxati
+    except (dns.exception.DNSException, Exception):
+        pass
+
+    # ---- Zone Transfer (AXFR) - oddiy DNS so'rovi, faqat noto'g'ri
+    # sozlangan serverlarda ishlaydi, o'zi hujum emas ----
+    for ns in ns_royxati[:3]:
+        try:
+            ns_ip = socket.gethostbyname(ns)
+            zona = dns.zone.from_xfr(dns.query.xfr(ns_ip, domen, timeout=5, lifetime=6))
+            if zona:
+                natija["zone_transfer_ochiq"] = True
+                break
+        except Exception:
+            continue
+
+    # ---- Wildcard DNS ----
+    try:
+        tasodifiy = f"tekshiruv-mavjud-emas-{os.urandom(4).hex()}.{domen}"
+        dns.resolver.resolve(tasodifiy, "A", lifetime=5)
+        natija["wildcard_dns"] = True
+    except (dns.exception.DNSException, Exception):
+        natija["wildcard_dns"] = False
+
+    return jsonify(natija)
+
+
+# ---------- 18. QO'SHIMCHA RAZVEDKA (robots.txt, favicon, typosquatting) ----------
+@app.route("/api/recon", methods=["GET"])
+def recon_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+    domen = domen_tozala(domen)
+
+    natija = {
+        "muvaffaqiyat": True, "domen": domen,
+        "robots_maxfiy_yollar": [], "favicon_xesh": None,
+        "domen_breach_soni": None, "typosquat_variantlar": []
+    }
+
+    # ---- robots.txt tahlili ----
+    try:
+        r_javob = requests.get(f"https://{domen}/robots.txt", timeout=6, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+        if r_javob.status_code == 200:
+            shubhali_kalitlar = ["admin", "backup", "config", "private", "secret", "login", "wp-admin", ".env"]
+            yollar = []
+            for qator in r_javob.text.splitlines():
+                qator = qator.strip()
+                if qator.lower().startswith("disallow:"):
+                    yol = qator.split(":", 1)[1].strip()
+                    if any(k in yol.lower() for k in shubhali_kalitlar):
+                        yollar.append(yol)
+            natija["robots_maxfiy_yollar"] = yollar
+    except requests.exceptions.RequestException:
+        pass
+
+    # ---- Favicon xeshi (passiv fingerprinting) ----
+    try:
+        f_javob = requests.get(f"https://{domen}/favicon.ico", timeout=6, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+        if f_javob.status_code == 200 and len(f_javob.content) > 0:
+            natija["favicon_xesh"] = hashlib.md5(f_javob.content).hexdigest()
+    except requests.exceptions.RequestException:
+        pass
+
+    # ---- Oddiy typosquatting variantlari (mavjudligini tekshirish, faqat DNS orqali) ----
+    try:
+        qismlar = domen.split(".")
+        if len(qismlar) >= 2:
+            nom = qismlar[0]
+            tld = ".".join(qismlar[1:])
+            variantlar = []
+            if len(nom) > 3:
+                # bitta harf olib tashlangan va bitta harf takrorlangan variantlar
+                variantlar.append(nom[:-1] + "." + tld)
+                variantlar.append(nom + nom[-1] + "." + tld)
+            band_variantlar = []
+            for v in variantlar[:2]:
+                try:
+                    socket.gethostbyname(v)
+                    band_variantlar.append(v)
+                except socket.gaierror:
+                    continue
+            natija["typosquat_variantlar"] = band_variantlar
+    except Exception:
+        pass
+
+    return jsonify(natija)
+
+
+# ---------- 19. SERVER JAVOB TEZLIGI ----------
+@app.route("/api/performance", methods=["GET"])
+def performance_endpoint():
+    domen = request.args.get("domen", "")
+    if not domen:
+        return jsonify({"xato": "domen parametri kerak"}), 400
+    domen = domen_tozala(domen)
+
+    try:
+        boshlanish = time.time()
+        requests.get(f"https://{domen}", timeout=10, headers={
+            "User-Agent": "Xavfsizlik-Tekshiruv-Vositasi/1.0"
+        })
+        tugash = time.time()
+        ms = round((tugash - boshlanish) * 1000)
+        return jsonify({"muvaffaqiyat": True, "domen": domen, "javob_vaqti_ms": ms})
+    except requests.exceptions.RequestException as e:
+        return jsonify({"muvaffaqiyat": False, "xato": str(e)}), 200
+
+
 # ---------- SALOMLASHISH (server ishlab turganini tekshirish uchun) ----------
 @app.route("/", methods=["GET"])
 def index():
@@ -1127,7 +1374,8 @@ def index():
             "/api/ssl", "/api/headers", "/api/email", "/api/dns",
             "/api/ports", "/api/whois", "/api/blacklist", "/api/subdomains",
             "/api/techscan", "/api/networkinfo", "/api/mailrecords", "/api/pwnedpassword",
-            "/api/extras", "/api/report"
+            "/api/extras", "/api/report",
+            "/api/tlsdeep", "/api/httpprotocol", "/api/dnsextra", "/api/recon", "/api/performance"
         ]
     })
 
